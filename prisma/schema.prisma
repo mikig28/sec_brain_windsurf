@@ -1,0 +1,16 @@
+generator client {
+  provider = "prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Thought {
+  id        String   @id @default(cuid())
+  content   String
+  type      String   @default("thought") // "thought", "video", "link"
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+} 
