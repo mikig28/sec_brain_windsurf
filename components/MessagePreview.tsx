@@ -1,5 +1,5 @@
-import { WhatsAppMessages } from './WhatsAppMessages'
+import WhatsAppMessages from './WhatsAppMessages'
 
 export function MessagePreview() {
   return <WhatsAppMessages />
-} 
+}
