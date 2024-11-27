@@ -1,16 +1,20 @@
 'use client'
 
-import { useEffect, useState } from 'react'
-import { createClient } from '@supabase/supabase-js'
+import React, { useEffect, useState } from 'react'
+import { createClientComponentClient } from '@supabase/auth-helpers-nextjs'
 import { format } from 'date-fns'
 import { X } from 'lucide-react'
 import Link from "next/link"
 import { extractYouTubeId } from "@/lib/youtube"
+import type { Database } from '@/types/database.types'
 
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-)
+type RealtimePayload<T> = {
+  new: T
+  old: T | null
+  eventType: 'INSERT' | 'UPDATE' | 'DELETE'
+}
+
+const supabase = createClientComponentClient<Database>()
 
 interface Message {
   id: string
@@ -43,9 +47,9 @@ export default function WhatsAppMessages() {
           table: 'entries',
           filter: "source=eq.whatsapp"
         },
-        (payload) => {
+        (payload: RealtimePayload<Message>) => {
           console.log('New entry received:', payload.new)
-          setMessages(prev => [payload.new as Message, ...prev])
+          setMessages(prev => [payload.new, ...prev])
         }
       )
       .subscribe()
@@ -60,13 +64,13 @@ export default function WhatsAppMessages() {
           table: 'videos',
           filter: "type=eq.image"
         },
-        (payload) => {
+        (payload: RealtimePayload<Database['public']['Tables']['videos']['Row']>) => {
           console.log('New video/image received:', payload.new)
           const newMessage: Message = {
             id: payload.new.video_id,
             title: 'WhatsApp Image/Video',
             content: '',
-            type: payload.new.type || 'video',
+            type: payload.new.type as 'video' | 'image' || 'video',
             created_at: payload.new.timestamp,
             updated_at: payload.new.timestamp,
             source: 'whatsapp',
@@ -76,13 +80,10 @@ export default function WhatsAppMessages() {
             url: payload.new.url,
             tags: []
           }
-          console.log('Adding new message:', newMessage)
           setMessages(prev => [newMessage, ...prev])
         }
       )
-      .subscribe((status) => {
-        console.log('Videos channel status:', status)
-      })
+      .subscribe()
 
     return () => {
       entriesChannel.unsubscribe()
@@ -102,17 +103,14 @@ export default function WhatsAppMessages() {
         .from('videos')
         .select('*')
         .order('timestamp', { ascending: false })
-    ]);
+    ])
 
-    console.log('Entries result:', entriesResult.data)
-    console.log('Videos result:', videosResult.data)
-
-    const entries = entriesResult.data || [];
-    const videos = (videosResult.data || []).map(video => ({
+    const entries = entriesResult.data || []
+    const videos = (videosResult.data || []).map((video: Database['public']['Tables']['videos']['Row']) => ({
       id: video.video_id,
       title: 'WhatsApp Image/Video',
       content: '',
-      type: video.type || 'video',
+      type: video.type as 'video' | 'image' || 'video',
       created_at: video.timestamp,
       updated_at: video.timestamp,
       source: 'whatsapp',
@@ -120,14 +118,56 @@ export default function WhatsAppMessages() {
       image_url: video.image_url,
       video_id: video.video_id,
       url: video.url
-    }));
+    }))
 
     const allMessages = [...entries, ...videos].sort((a, b) => 
       new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-    );
+    )
 
-    console.log('Setting all messages:', allMessages)
-    setMessages(allMessages);
+    setMessages(allMessages)
+  }
+
+  function renderMessageContent(message: Message) {
+    if (message.type === 'image' && message.image_url) {
+      return (
+        <div className="max-w-full">
+          <img 
+            src={message.image_url} 
+            alt="WhatsApp Image" 
+            className="max-w-full h-auto rounded-lg"
+            onError={(e) => {
+              console.error('Image failed to load:', message.image_url);
+              e.currentTarget.style.display = 'none';
+            }}
+          />
+        </div>
+      );
+    }
+
+    // Regular message with URLs
+    const urlRegex = /https?:\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&//=]*)/g;
+    const parts = message.content.split(urlRegex);
+    const urls = message.content.match(urlRegex) || [];
+    
+    return (
+      <div className="text-[#111B21] dark:text-white break-words whitespace-pre-wrap">
+        {parts.map((part, index) => (
+          <React.Fragment key={index}>
+            {part}
+            {urls[index] && (
+              <a 
+                href={urls[index]}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-blue-600 hover:underline"
+              >
+                {urls[index]}
+              </a>
+            )}
+          </React.Fragment>
+        ))}
+      </div>
+    );
   }
 
   async function deleteMessage(id: string) {
@@ -138,65 +178,6 @@ export default function WhatsAppMessages() {
 
     if (!error) {
       setMessages(prev => prev.filter(msg => msg.id !== id))
-    }
-  }
-
-  function renderMessageContent(message: Message) {
-    console.log('Rendering message type:', message.type, 'with data:', message);
-    switch (message.type) {
-      case 'image':
-        return (
-          <div>
-            <img 
-              src={message.image_url} 
-              alt={message.title}
-              className="w-full h-auto rounded-md max-h-[400px] object-contain"
-              onError={(e) => console.error('Image failed to load:', e)}
-              onLoad={() => console.log('Image loaded successfully:', message.image_url)}
-            />
-            {message.content && (
-              <p className="text-[#111B21] dark:text-white break-words mt-1">
-                {message.content}
-              </p>
-            )}
-          </div>
-        )
-      
-      case 'video':
-        return (
-          <div className="aspect-video">
-            <iframe
-              width="100%"
-              height="100%"
-              src={`https://www.youtube.com/embed/${message.video_id}`}
-              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-              allowFullScreen
-              className="rounded-md"
-            />
-          </div>
-        )
-      
-      default:
-        return (
-          <p className="text-[#111B21] dark:text-white break-words">
-            {message.content.split(' ').map((word, i) => {
-              const youtubeId = extractYouTubeId(word)
-              if (youtubeId) {
-                return (
-                  <Link
-                    key={i}
-                    href={word}
-                    className="text-blue-500 hover:underline"
-                    target="_blank"
-                  >
-                    {word}{' '}
-                  </Link>
-                )
-              }
-              return word + ' '
-            })}
-          </p>
-        )
     }
   }
 

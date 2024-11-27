@@ -1,16 +1,21 @@
+import { createServerComponentClient } from '@supabase/auth-helpers-nextjs'
+import { cookies } from 'next/headers'
+import type { Database } from '@/types/database.types'
 import puppeteer, { Browser, Page } from 'puppeteer'
-import { createClient } from '@supabase/supabase-js'
 import path from 'path'
-import { Buffer } from 'buffer';
-import { extractYouTubeId } from '@/lib/youtube';
+import { Buffer } from 'buffer'
+import { extractYouTubeId } from '@/lib/youtube'
+import { detectPlatform } from '@/lib/linkUtils'
+import { v4 as uuidv4 } from 'uuid'
 
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-)
+const supabase = createServerComponentClient<Database>({ cookies })
 
 let browser: Browser | null = null
 let page: Page | null = null
+
+async function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
 
 export async function setupWhatsAppPuppeteer() {
   if (browser) {
@@ -24,6 +29,7 @@ export async function setupWhatsAppPuppeteer() {
   try {
     browser = await puppeteer.launch({
       headless: false,
+      executablePath: process.env.CHROME_BIN || undefined,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -31,9 +37,12 @@ export async function setupWhatsAppPuppeteer() {
         '--window-size=1920,1080',
         `--user-data-dir=${userDataDir}`,
         '--disable-gpu',
-        '--disable-features=site-per-process'
+        '--disable-software-rasterizer',
+        '--disable-features=site-per-process',
+        '--disable-extensions',
+        '--remote-debugging-port=9222'
       ],
-      defaultViewport: null
+      defaultViewport: null,
     })
 
     page = await browser.newPage()
@@ -75,34 +84,53 @@ async function connectToWhatsApp(page: Page) {
 
     console.log('WhatsApp Web loaded, waiting for initial state...')
 
-    const initialState = await Promise.race([
-      page.waitForSelector('div[data-testid="qrcode"]').then(() => 'QR_CODE'),
-      page.waitForSelector('div[data-testid="default-user"]').then(() => 'CHAT_LIST'),
-      page.waitForSelector('div[data-testid="chat"]').then(() => 'CHAT_LIST')
-    ]).catch(() => 'UNKNOWN')
+    // נחכה לכל אחד מהאלמנטים האפשריים
+    const possibleElements = [
+      '[data-testid="qrcode"]',
+      '[data-testid="chatlist"]',
+      '[data-testid="chat-list"]',
+      '[data-testid="default-user"]',
+      '.landing-wrapper',
+      '.app-wrapper-web',
+      '[data-testid="side"]', // סלקטור חדש
+      'div[data-testid="cell-frame-container"]' // סלקטור של צ'אט בודד
+    ]
 
-    console.log('Initial state:', initialState)
-
-    if (initialState === 'QR_CODE') {
-      console.log('QR Code detected. Please scan with your phone...')
-      await Promise.race([
-        page.waitForSelector('div[data-testid="default-user"]', { timeout: 120000 }),
-        page.waitForSelector('div[data-testid="chat"]', { timeout: 120000 })
-      ])
+    let detectedElement = null
+    for (const selector of possibleElements) {
+      try {
+        const element = await page.waitForSelector(selector, { timeout: 5000 })
+        if (element) {
+          detectedElement = selector
+          console.log(`Detected element: ${selector}`)
+          break
+        }
+      } catch (err) {
+        continue
+      }
     }
 
-    console.log('Chat list detected. Checking for open chat...')
+    if (!detectedElement) {
+      console.log('No initial elements detected, waiting for manual navigation...')
+      await delay(10000) // תן למשתמש זמן לנווט ידנית
+    }
 
+    // בדיקה אם יש צ'אט פתוח
+    console.log('Checking for open chat...')
     const chatSelectors = [
-      'div[data-testid="conversation-panel-wrapper"]',
-      'div[data-testid="conversation-panel"]',
-      'div[data-testid="message-list"]',
-      'div[role="application"]'
+      '[data-testid="conversation-panel-wrapper"]',
+      '[data-testid="conversation-panel"]',
+      '[data-testid="message-list"]',
+      '[data-testid="conversation-compose-box-input"]',
+      '#main',
+      '[data-testid="chat"]'
     ]
 
     let chatDetected = false
     for (let i = 0; i < 15 && !chatDetected; i++) {
       console.log(`Attempt ${i + 1} to detect open chat...`)
+      
+      await delay(2000) // המתנה ארוכה יותר בין ניסיונות
       
       for (const selector of chatSelectors) {
         try {
@@ -118,25 +146,29 @@ async function connectToWhatsApp(page: Page) {
       }
 
       if (!chatDetected) {
-        const messages = await page.$$('div[data-testid="msg-container"]')
-        if (messages.length > 0) {
-          console.log('Messages detected directly')
-          chatDetected = true
-          break
+        try {
+          // נסה לפתוח את הצ'אט הראשון א אין צ'אט פתוח
+          const firstChat = await page.$('div[data-testid="cell-frame-container"]')
+          if (firstChat) {
+            console.log('Found chat in list, attempting to open...')
+            await firstChat.click()
+            await delay(3000)
+            chatDetected = true
+            break
+          }
+        } catch (err) {
+          console.log('Error trying to open chat:', err)
         }
-
-        console.log('Waiting for chat to be detected...')
-        await new Promise(resolve => setTimeout(resolve, 2000))
       }
     }
 
     if (!chatDetected) {
-      throw new Error('Could not detect open chat after waiting')
+      console.log('Could not detect chat automatically. Please ensure a chat is open.')
+      await delay(10000) // תן למשתמש זמן לפתוח צ'אט ידנית
     }
 
-    console.log('Chat detected successfully')
-    await new Promise(resolve => setTimeout(resolve, 2000))
-
+    console.log('Setup completed')
+    
   } catch (error: any) {
     console.error('Detailed error in connectToWhatsApp:', {
       message: error.message,
@@ -150,7 +182,9 @@ interface WhatsAppMessage {
   content: string;
   id: string;
   sender: string;
-  imageUrl?: string;
+  imageUrl: string | null;
+  type: string;
+  urls?: string[];
 }
 
 async function startMessageMonitoring(page: Page) {
@@ -179,176 +213,143 @@ async function startMessageMonitoring(page: Page) {
               return id && !processedSet.has(id)
             })
             .map(el => {
-              // Check for image
-              const imgElement = el.querySelector('img[src^="blob:"]') as HTMLImageElement;
-              const imageUrl = imgElement?.src || null;
+              const imgElement = el.querySelector('img[src^="blob:"]') as HTMLImageElement
+              const imageUrl = imgElement?.src || null
               
-              // Check for text content
+              // Get text content if any
               const textContent = el.querySelector('span.selectable-text')?.textContent || 
-                                el.querySelector('div.selectable-text')?.textContent || 
-                                (imageUrl ? 'Image message' : el.textContent) || '';
-              
+                                 el.querySelector('div.selectable-text')?.textContent || ''
+
+              // Extract URLs from text content
+              const urlMatches = textContent.match(/https?:\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&//=]*)/g) || []
+
               return {
-                content: textContent.trim(),
+                content: textContent,
                 id: el.getAttribute('data-id') || '',
                 sender: el.getAttribute('data-pre-plain-text')?.split(']')[1]?.trim() || 'Unknown',
-                imageUrl
+                imageUrl,
+                type: imageUrl ? 'image' : 'thought',
+                urls: urlMatches
               }
             })
-            .filter(msg => 
-              (msg.content || msg.imageUrl) && 
-              !msg.content.includes('This message was deleted') &&
-              !msg.content.includes('forwardedForwarded')
-            )
         }, Array.from(processedIds)) as WhatsAppMessage[]
 
         for (const message of messages) {
           if (!processedIds.has(message.id)) {
             console.log('Processing new message:', message.content)
 
-            // Check for YouTube links first
-            const URLs = message.content.match(/(https?:\/\/[^\s]+)/g);
-            if (URLs) {
-              for (const url of URLs) {
-                const youtubeId = extractYouTubeId(url);
-                if (youtubeId) {
-                  console.log('Found YouTube video:', youtubeId);
+            // Process URLs if they exist
+            if (message.urls?.length) {
+              for (const url of message.urls) {
+                try {
+                  const youtubeId = extractYouTubeId(url)
                   
-                  // Check if video already exists
-                  const { data: existingVideo } = await supabase
-                    .from('videos')
-                    .select('id')
-                    .eq('video_id', youtubeId)
-                    .maybeSingle();
+                  if (youtubeId) {
+                    const { data: existingVideo } = await supabase
+                      .from('videos')
+                      .select('id')
+                      .eq('video_id', youtubeId)
+                      .maybeSingle()
 
-                  if (existingVideo) {
-                    console.log('Video already exists, skipping:', youtubeId);
-                    continue;
-                  }
-
-                  // Save new video
-                  const { data, error } = await supabase
-                    .from('videos')
-                    .insert({ 
-                      url,
-                      video_id: youtubeId,
-                      timestamp: new Date().toISOString()
-                    })
-                    .select()
-                    .single();
-
-                  if (error) {
-                    console.error('Error saving video:', error);
+                    if (!existingVideo) {
+                      await supabase
+                        .from('videos')
+                        .insert({ 
+                          url,
+                          video_id: youtubeId,
+                          timestamp: new Date().toISOString()
+                        })
+                    }
                   } else {
-                    console.log('Successfully saved new video:', data);
+                    const platform = detectPlatform(url.trim())
+                    const { data: existingLink } = await supabase
+                      .from('links')
+                      .select('id')
+                      .eq('url', url)
+                      .maybeSingle()
+
+                    if (!existingLink) {
+                      const { error } = await supabase
+                        .from('links')
+                        .insert({ 
+                          url: url.trim(),
+                          title: `${platform.toUpperCase()} Link`,
+                          platform: platform,
+                          created_at: new Date().toISOString()
+                        })
+                      
+                      if (error) {
+                        console.error('Error saving link:', error)
+                      } else {
+                        console.log('Successfully saved link:', url)
+                      }
+                    }
                   }
+                } catch (error) {
+                  console.error('Error processing URL:', url, error)
                 }
               }
             }
 
-            // Continue with existing image and message handling
+            // Handle image messages
             if (message.imageUrl) {
               try {
-                // שיפור זיהוי התמונה
-                const imageData = await page.evaluate(async (messageId) => {
-                  const messageEl = document.querySelector(`[data-id="${messageId}"]`);
-                  if (!messageEl) return null;
-
-                  // מחפשים את התמונה בכל הדרכים האפשריות
-                  const imgSelectors = [
-                    'img[src^="blob:"]',
-                    'img[src^="data:"]',
-                    'img[data-testid="image-thumb"]',
-                    'img[data-testid="image"]',
-                    'img.media-image'
-                  ];
-
-                  let img: HTMLImageElement | null = null;
-                  for (const selector of imgSelectors) {
-                    img = messageEl.querySelector(selector) as HTMLImageElement;
-                    if (img) break;
-                  }
-
-                  if (!img) {
-                    console.log('No image found with selectors:', imgSelectors);
-                    return null;
-                  }
-
-                  // המתנה לטעינת התמונה
-                  if (!img.complete) {
-                    await new Promise((resolve) => {
-                      img!.onload = resolve;
-                      img!.onerror = resolve;
-                    });
-                  }
-
+                // Get the image data directly through Puppeteer
+                const imageData = await page.evaluate(async (blobUrl) => {
                   try {
-                    // יצירת canvas ושמירת התמונה
-                    const canvas = document.createElement('canvas');
-                    canvas.width = img.naturalWidth || img.width;
-                    canvas.height = img.naturalHeight || img.height;
-                    
-                    const ctx = canvas.getContext('2d');
-                    if (!ctx) {
-                      console.error('Failed to get canvas context');
-                      return null;
-                    }
+                    // Create an image element and wait for it to load
+                    const img = document.createElement('img');
+                    await new Promise((resolve, reject) => {
+                      img.onload = resolve;
+                      img.onerror = reject;
+                      img.src = blobUrl;
+                    });
 
-                    ctx.drawImage(img, 0, 0);
-                    return canvas.toDataURL('image/jpeg', 0.9);
-                  } catch (err) {
-                    console.error('Error converting image to data URL:', err);
+                    // Create a canvas and draw the image
+                    const canvas = document.createElement('canvas');
+                    canvas.width = img.width;
+                    canvas.height = img.height;
+                    const ctx = canvas.getContext('2d');
+                    ctx?.drawImage(img, 0, 0);
+
+                    // Get base64 data
+                    return canvas.toDataURL('image/jpeg');
+                  } catch (error) {
+                    console.error('Error converting blob:', error);
                     return null;
                   }
-                }, message.id);
+                }, message.imageUrl);
 
-                if (!imageData) {
-                  console.error('Failed to get image data');
-                  return;
+                if (imageData) {
+                  const { error } = await supabase
+                    .from('videos')
+                    .insert({ 
+                      url: message.imageUrl,
+                      type: 'image',
+                      timestamp: new Date().toISOString(),
+                      image_url: imageData,
+                      video_id: uuidv4()
+                    });
+                  
+                  if (error) {
+                    console.error('Error saving image:', error);
+                  }
                 }
-
-                // המשך הקוד הקיים...
-                const base64Data = imageData.split(',')[1];
-                const imageBuffer = Buffer.from(base64Data, 'base64');
-                const filename = `${Date.now()}-${Math.random().toString(36).substring(7)}.jpg`;
-
-                const { data: uploadData, error: uploadError } = await supabase.storage
-                  .from('chat-images')
-                  .upload(filename, imageBuffer, {
-                    contentType: 'image/jpeg',
-                    cacheControl: '3600'
-                  });
-
-                if (uploadError) throw uploadError;
-
-                const { data: { publicUrl } } = supabase.storage
-                  .from('chat-images')
-                  .getPublicUrl(filename);
-
-                // שמירה בטבלת videos
-                await supabase.from('videos').insert([{
-                  video_id: filename,
-                  url: publicUrl,
-                  timestamp: new Date().toISOString(),
-                  type: 'image',
-                  image_url: publicUrl
-                }]);
-
-                console.log('Successfully stored image:', publicUrl);
               } catch (error) {
                 console.error('Error processing image:', error);
               }
-            } else {
-              // Handle regular message (existing logic)
+            }
+
+            if (message.content) {
               const { data: existing } = await supabase
                 .from('entries')
                 .select('id')
                 .eq('content', message.content)
                 .eq('source', 'whatsapp')
-                .maybeSingle();
+                .maybeSingle()
 
               if (!existing) {
-                const { error: insertError } = await supabase.from('entries').insert([{
+                await supabase.from('entries').insert([{
                   title: message.sender ? `Message from ${message.sender}` : 'WhatsApp Message',
                   content: message.content,
                   type: 'thought',
@@ -357,23 +358,16 @@ async function startMessageMonitoring(page: Page) {
                   source: 'whatsapp',
                   status: 'active',
                   tags: []
-                }]);
-
-                if (insertError) {
-                  console.error('Error storing message:', insertError);
-                }
+                }])
               }
             }
-            
-            processedIds.add(message.id);
+
+            processedIds.add(message.id)
           }
         }
       }
     } catch (error: any) {
       console.error('Error in checkNewMessages:', error)
-      if (error.message?.includes('detached Frame')) {
-        await setupWhatsAppPuppeteer()
-      }
     }
   }
 
